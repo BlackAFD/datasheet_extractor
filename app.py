@@ -28,17 +28,17 @@ Extract the following fields and return ONLY a valid JSON object, no explanation
 - rth_ja: Thermal resistance junction-to-ambient in °C/W (numeric only, no units)
 - rth_jc: Thermal resistance junction-to-case in °C/W (numeric only, no units)
 - rth_jb: Thermal resistance junction-to-board in °C/W (numeric only, no units)
-- tj_max: Maximum junction temperature in °C (numeric only, use operating max if both operating and absolute are listed)
+- tj_max: Maximum junction temperature in °C (numeric only)
 - power_dissipation: Maximum power dissipation in W (numeric only, no units)
-- confidence: for each field above, rate as "high", "low", or "not_found"
-- flags: list of plain-English warnings about anything ambiguous or uncertain
-- source_quote: for each field, copy the exact sentence or table row the value was pulled from
+- confidence: REQUIRED dict with a key for EVERY field above. Each value must be "high", "low", or "not_found". Never return null for any key.
+- flags: list of plain-English warnings. Return empty list [] if none.
+- source_quote: REQUIRED dict with a key for EVERY field above. Copy the exact sentence or table row the value was pulled from. If not found, use "not found in datasheet".
 
 Rules:
-- If a field is not found or not applicable, return null
-- For power_dissipation: only extract if explicitly stated as a single value in watts. If stated as "internally limited" or given only as a formula, return null
-- If the datasheet covers multiple packages, extract for the most common or first-listed package and flag it
-- For inductors, capacitors, or other passives with no junction, return null for all thermal fields
+- If a field value is not found, return null for the value but still set confidence to "not_found" and source_quote to "not found in datasheet"
+- confidence and source_quote must ALWAYS be complete dicts with all 7 keys: part_number, package, rth_ja, rth_jc, rth_jb, tj_max, power_dissipation
+- For power_dissipation: only extract if explicitly stated as a single value in watts. If "internally limited" or formula only, return null
+- If multiple packages exist, extract for the most common or first-listed and flag it
 - For confidence: "high" = explicit table value, "low" = inferred or found in text, "not_found" = absent
 - Return only the JSON object, nothing else
 """
@@ -93,6 +93,39 @@ def safe_list(val):
 
 
 def extract_component_data(uploaded_file, filename):
+    FIELDS = ["part_number", "package", "rth_ja", "rth_jc", "rth_jb", "tj_max", "power_dissipation"]
+
+def normalize_result(data):
+    """Fill in missing confidence/source_quote keys so Excel is never blank."""
+    conf = data.get("confidence")
+    if not isinstance(conf, dict):
+        conf = {}
+    src = data.get("source_quote")
+    if not isinstance(src, dict):
+        src = {}
+    flags = data.get("flags")
+    if not isinstance(flags, list):
+        flags = [str(flags)] if flags else []
+
+    for field in FIELDS:
+        # If LLM extracted a value but forgot confidence, infer it
+        if field not in conf or conf[field] is None:
+            if data.get(field) is not None:
+                conf[field] = "low"   # extracted but confidence unknown → mark low
+            else:
+                conf[field] = "not_found"
+
+        # If LLM extracted a value but forgot source quote
+        if field not in src or src[field] is None:
+            src[field] = "not found in datasheet"
+
+    data["confidence"] = conf
+    data["source_quote"] = src
+    data["flags"] = flags
+    return data
+
+
+def extract_component_data(uploaded_file, filename):
     full_text = extract_text_from_pdf(uploaded_file)
     thermal_text = extract_thermal_section(full_text)
 
@@ -110,6 +143,7 @@ def extract_component_data(uploaded_file, filename):
         json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         data = json.loads(json_match.group()) if json_match else json.loads(raw_output)
         data['source_file'] = filename
+        data = normalize_result(data)   # ← fix missing fields here
         return data, None
 
     except json.JSONDecodeError as e:
