@@ -8,13 +8,16 @@ from openpyxl.styles import Font, PatternFill, Alignment
 import streamlit as st
 from groq import Groq
 
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Datasheet Extractor", page_icon="🔌", layout="wide")
 st.title("🔌 Datasheet Thermal Extractor")
 st.caption("Upload component datasheets (PDF) to extract thermal parameters automatically.")
 
+
 # ── API Key ───────────────────────────────────────────────────────────────────
 client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert electronics engineer extracting data from component datasheets.
@@ -40,6 +43,7 @@ Rules:
 - Return only the JSON object, nothing else
 """
 
+
 # ── Helper Functions ──────────────────────────────────────────────────────────
 def extract_text_from_pdf(uploaded_file):
     text = ""
@@ -49,6 +53,7 @@ def extract_text_from_pdf(uploaded_file):
             if page_text:
                 text += page_text + "\n"
     return text
+
 
 def extract_thermal_section(full_text, window=6000):
     thermal_keywords = [
@@ -73,6 +78,19 @@ def extract_thermal_section(full_text, window=6000):
         return full_text[start:end]
     else:
         return full_text[:6000]
+
+
+def safe_dict(val):
+    """Return val if it's a dict, else empty dict."""
+    return val if isinstance(val, dict) else {}
+
+
+def safe_list(val):
+    """Return val if it's a list, else wrap in list or return empty."""
+    if isinstance(val, list):
+        return val
+    return [str(val)] if val else []
+
 
 def extract_component_data(uploaded_file, filename):
     full_text = extract_text_from_pdf(uploaded_file)
@@ -99,6 +117,7 @@ def extract_component_data(uploaded_file, filename):
     except Exception as e:
         return None, str(e)
 
+
 def build_excel(results):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -124,25 +143,24 @@ def build_excel(results):
         cell.alignment = Alignment(horizontal="center")
 
     for row, r in enumerate(results, 2):
-        conf = r.get("confidence") or {}
-        src = r.get("source_quote") or {}
-        flags = r.get("flags") or []
+        conf = safe_dict(r.get("confidence"))
+        src = safe_dict(r.get("source_quote"))
+        flags = safe_list(r.get("flags"))
 
         row_data = [
             r.get("source_file"),
             r.get("part_number"),
             r.get("package"),
-            r.get("rth_ja"),       conf.get("rth_ja"),       src.get("rth_ja"),
-            r.get("rth_jc"),       conf.get("rth_jc"),       src.get("rth_jc"),
-            r.get("rth_jb"),       conf.get("rth_jb"),       src.get("rth_jb"),
-            r.get("tj_max"),       conf.get("tj_max"),       src.get("tj_max"),
+            r.get("rth_ja"),            conf.get("rth_ja"),            src.get("rth_ja"),
+            r.get("rth_jc"),            conf.get("rth_jc"),            src.get("rth_jc"),
+            r.get("rth_jb"),            conf.get("rth_jb"),            src.get("rth_jb"),
+            r.get("tj_max"),            conf.get("tj_max"),            src.get("tj_max"),
             r.get("power_dissipation"), conf.get("power_dissipation"), src.get("power_dissipation"),
             " | ".join(flags) if flags else ""
         ]
 
         for col, value in enumerate(row_data, 1):
             cell = ws.cell(row=row, column=col, value=value)
-            # Highlight low confidence cells in yellow
             if value == "low":
                 cell.fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
             elif value == "not_found":
@@ -156,6 +174,7 @@ def build_excel(results):
     wb.save(buffer)
     buffer.seek(0)
     return buffer
+
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 uploaded_files = st.file_uploader(
@@ -197,8 +216,8 @@ if uploaded_files:
         import pandas as pd
         display_rows = []
         for r in results:
-            conf = r.get("confidence") or {}
-            flags = r.get("flags") or []
+            conf = safe_dict(r.get("confidence"))
+            flags = safe_list(r.get("flags"))
             display_rows.append({
                 "File": r.get("source_file"),
                 "Part No.": r.get("part_number"),
@@ -217,7 +236,7 @@ if uploaded_files:
         st.dataframe(df, use_container_width=True)
 
         # Flags summary
-        all_flags = [(r.get("source_file"), f) for r in results for f in (r.get("flags") or [])]
+        all_flags = [(r.get("source_file"), f) for r in results for f in safe_list(r.get("flags"))]
         if all_flags:
             st.subheader("⚠️ Flags to Review")
             for source, flag in all_flags:
