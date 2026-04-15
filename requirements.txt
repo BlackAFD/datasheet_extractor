@@ -1,0 +1,5 @@
+streamlit
+pdfplumber
+groq
+openpyxl
+pandas
