@@ -1,6 +1,7 @@
 import json
 import re
 import io
+import requests
 import pdfplumber
 import openpyxl
 import pandas as pd
@@ -11,13 +12,10 @@ from groq import Groq
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Datasheet Extractor", page_icon="🔌", layout="wide")
 st.title("🔌 Datasheet Thermal Extractor")
-st.caption("Upload component datasheets (PDF) to extract thermal parameters automatically.")
+st.caption("Upload PDFs or search by part number to extract thermal parameters automatically.")
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-FIELDS = ["part_number", "package", "rth_ja", "rth_jc", "rth_jb", "tj_max", "power_dissipation"]
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert electronics engineer extracting data from component datasheets.
@@ -32,19 +30,19 @@ Extract the following fields and return ONLY a valid JSON object, no explanation
 - power_dissipation: Maximum power dissipation in W (numeric only, no units)
 - confidence: dict with keys rth_ja, rth_jc, rth_jb, tj_max, power_dissipation. Each value must be exactly "high", "low", or "not_found". Never null.
 - flags: list of plain-English warnings. Return [] if none.
-- source_quote: dict with keys rth_ja, rth_jc, rth_jb, tj_max, power_dissipation. Copy the exact text the value came from. Use "not found" if absent.
+- source_quote: dict with keys rth_ja, rth_jc, rth_jb, tj_max, power_dissipation. Copy the exact sentence or table row the value came from. Use "not found" if absent.
 
 Rules:
-- If a value is not found, return null for the value, "not_found" for confidence, and "not found" for source_quote
+- If a value is not found, return null for the value, "not_found" for confidence, "not found" for source_quote
 - confidence and source_quote must always have all 5 keys listed above
 - For confidence: "high" = explicit table value, "low" = inferred or found in running text
 - Return only the JSON object, nothing else
 """
 
 # ── PDF Helpers ───────────────────────────────────────────────────────────────
-def extract_text_from_pdf(uploaded_file):
+def extract_text_from_pdf(file):
     text = ""
-    with pdfplumber.open(uploaded_file) as pdf:
+    with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
@@ -60,6 +58,7 @@ def extract_thermal_section(full_text, window=6000):
         r'junction.{0,10}ambient', r'junction.{0,10}case',
         r'maximum ratings', r'absolute maximum',
         r'thermal data', r'thermal information', r'package.*thermal',
+        r'Zth', r'thermal impedance', r'ψJA', r'ψJC',
     ]
     pattern = '|'.join(thermal_keywords)
     match = re.search(pattern, full_text, re.IGNORECASE)
@@ -70,32 +69,35 @@ def extract_thermal_section(full_text, window=6000):
     return full_text[:6000]
 
 
+# ── Source Quote Finder ───────────────────────────────────────────────────────
+def find_source_quote(text, value):
+    if value is None:
+        return "not found in datasheet"
+    search_val = str(value).split(".")[0]
+    lines = re.split(r'[\n]', text)
+    for line in lines:
+        if search_val in line and len(line.strip()) > 5:
+            return line.strip()[:200]
+    return "not found in datasheet"
+
+
 # ── Normalize LLM output ──────────────────────────────────────────────────────
-def normalize_result(data):
-    # Fix confidence
+def normalize_result(data, thermal_text=""):
     conf = data.get("confidence")
     if not isinstance(conf, dict):
         conf = {}
-
-    # Fix source_quote
     src = data.get("source_quote")
     if not isinstance(src, dict):
         src = {}
-
-    # Fix flags
     flags = data.get("flags")
     if not isinstance(flags, list):
         flags = [str(flags)] if flags else []
 
     thermal_fields = ["rth_ja", "rth_jc", "rth_jb", "tj_max", "power_dissipation"]
     for field in thermal_fields:
-        # Fill missing or null/empty confidence
         if not conf.get(field):
             conf[field] = "low" if data.get(field) is not None else "not_found"
-
-        # Fill missing or null/empty source_quote
-        if not src.get(field):
-            src[field] = "not found in datasheet"
+        src[field] = find_source_quote(thermal_text, data.get(field))
 
     data["confidence"] = conf
     data["source_quote"] = src
@@ -103,9 +105,41 @@ def normalize_result(data):
     return data
 
 
+# ── Datasheet Web Search ──────────────────────────────────────────────────────
+def search_datasheet_url(part_number):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    query = f"{part_number} datasheet filetype:pdf"
+    ddg_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+    try:
+        resp = requests.get(ddg_url, headers=headers, timeout=10)
+        pdf_links = re.findall(r'https?://[^\s"<>&]+\.pdf', resp.text)
+        # Prefer manufacturer domains
+        preferred = ["st.com", "ti.com", "infineon.com", "nxp.com", "onsemi.com",
+                     "rohm.com", "diodes.com", "vishay.com", "alldatasheet.com"]
+        for link in pdf_links:
+            if any(domain in link for domain in preferred):
+                return link
+        # Return first PDF found if no preferred domain matched
+        return pdf_links[0] if pdf_links else None
+    except Exception:
+        return None
+
+
+def download_pdf(url):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        content_type = resp.headers.get("Content-Type", "")
+        if resp.status_code == 200 and ("pdf" in content_type.lower() or url.endswith(".pdf")):
+            return io.BytesIO(resp.content)
+    except Exception:
+        pass
+    return None
+
+
 # ── Extraction ────────────────────────────────────────────────────────────────
-def extract_component_data(uploaded_file, filename):
-    full_text = extract_text_from_pdf(uploaded_file)
+def extract_component_data(file, filename):
+    full_text = extract_text_from_pdf(file)
     thermal_text = extract_thermal_section(full_text)
 
     try:
@@ -122,7 +156,7 @@ def extract_component_data(uploaded_file, filename):
         json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         data = json.loads(json_match.group()) if json_match else json.loads(raw_output)
         data["source_file"] = filename
-        data = normalize_result(data)
+        data = normalize_result(data, thermal_text)
         return data, None
 
     except json.JSONDecodeError as e:
@@ -191,41 +225,69 @@ def build_excel(results):
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-uploaded_files = st.file_uploader(
-    "Upload Datasheet PDFs",
-    type=["pdf"],
-    accept_multiple_files=True
-)
+tab1, tab2 = st.tabs(["📎 Upload PDF", "🔍 Search by Part Number"])
 
-if uploaded_files:
-    st.write(f"**{len(uploaded_files)} file(s) uploaded.** Click below to extract.")
+files_to_process = []
 
+with tab1:
+    uploaded_files = st.file_uploader(
+        "Upload Datasheet PDFs",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+    if uploaded_files:
+        files_to_process = [(f, f.name) for f in uploaded_files]
+        st.write(f"**{len(files_to_process)} file(s) uploaded.**")
+
+with tab2:
+    part_input = st.text_area(
+        "Enter part numbers (one per line)",
+        placeholder="e.g.\nIRF540N\nLM317\nSTM32F103C8T6"
+    )
+    search_btn = st.button("🔍 Find Datasheets", type="primary")
+
+    if search_btn and part_input.strip():
+        parts = [p.strip() for p in part_input.strip().splitlines() if p.strip()]
+        for part in parts:
+            with st.spinner(f"Searching datasheet for {part}..."):
+                pdf_url = search_datasheet_url(part)
+                if pdf_url:
+                    st.caption(f"✅ Found: {pdf_url}")
+                    pdf_file = download_pdf(pdf_url)
+                    if pdf_file:
+                        files_to_process.append((pdf_file, f"{part}.pdf"))
+                    else:
+                        st.warning(f"⚠️ Found URL but could not download PDF for {part}")
+                else:
+                    st.warning(f"⚠️ No datasheet found for {part}")
+
+# ── Process & Extract ─────────────────────────────────────────────────────────
+if files_to_process:
     if st.button("🚀 Extract Data", type="primary"):
         results = []
         progress = st.progress(0)
         status = st.empty()
 
-        for i, file in enumerate(uploaded_files):
-            status.write(f"⏳ Processing **{file.name}**...")
-            data, error = extract_component_data(file, file.name)
+        for i, (file, filename) in enumerate(files_to_process):
+            status.write(f"⏳ Processing **{filename}**...")
+            data, error = extract_component_data(file, filename)
 
             if data:
                 results.append(data)
             else:
-                st.warning(f"⚠️ Failed on {file.name}: {error}")
+                st.warning(f"⚠️ Failed on {filename}: {error}")
                 results.append(normalize_result({
-                    "source_file": file.name,
+                    "source_file": filename,
                     "part_number": "EXTRACTION FAILED",
                     "package": None, "rth_ja": None, "rth_jc": None,
                     "rth_jb": None, "tj_max": None, "power_dissipation": None,
                     "confidence": {}, "flags": [error], "source_quote": {}
                 }))
 
-            progress.progress((i + 1) / len(uploaded_files))
+            progress.progress((i + 1) / len(files_to_process))
 
         status.success(f"✅ Done! Processed {len(results)} file(s).")
 
-        # Results table
         st.subheader("📊 Extracted Data")
         display_rows = []
         for r in results:
@@ -248,14 +310,12 @@ if uploaded_files:
         df = pd.DataFrame(display_rows)
         st.dataframe(df, use_container_width=True)
 
-        # Flags summary
         all_flags = [(r.get("source_file"), f) for r in results for f in r.get("flags", [])]
         if all_flags:
             st.subheader("⚠️ Flags to Review")
             for source, flag in all_flags:
                 st.warning(f"**{source}**: {flag}")
 
-        # Download
         excel_buffer = build_excel(results)
         st.download_button(
             label="📥 Download Excel",
@@ -265,4 +325,4 @@ if uploaded_files:
         )
 
 else:
-    st.info("👆 Upload one or more PDF datasheets to get started.")
+    st.info("👆 Upload PDFs or search by part number to get started.")

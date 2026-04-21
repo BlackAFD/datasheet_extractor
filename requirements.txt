@@ -1,5 +1,6 @@
 streamlit
-pdfplumber
 groq
+pdfplumber
 openpyxl
 pandas
+requests
